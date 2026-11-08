@@ -9,8 +9,10 @@
 #include "hc.h"
 #include <errno.h>
 #include <ftw.h>
+#include <limits.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 
 #define UCACHE_MAX 512
 #define UCACHE_TTL 15            /* secondes */
@@ -19,9 +21,27 @@ typedef struct { char id[17]; unsigned long long used; time_t when; } ucache_t;
 static ucache_t ucache[UCACHE_MAX];
 static pthread_mutex_t ulk = PTHREAD_MUTEX_INITIALIZER;
 
-void disk_dir(const char *id, char *out, size_t sz)
+static void default_dir(const char *id, char *out, size_t sz)
 {
     snprintf(out, sz, "%s/disks/%s", g_cfg.data_dir, id);
+}
+
+/* dossier réel d'un disque : le dossier source pour un montage, sinon <données>/disks/<id> */
+void disk_dir(const char *id, char *out, size_t sz)
+{
+    disk_t d;
+    if (disk_get(id, &d) == 0 && d.src[0]) snprintf(out, sz, "%s", d.src);
+    else default_dir(id, out, sz);
+}
+
+/* Un lien symbolique placé dans le dossier monté ne doit pas permettre d'en sortir. */
+int mount_inside(const disk_t *d, const char *full)
+{
+    if (!d->src[0]) return 1;
+    char real[PATH_MAX];
+    if (!realpath(full, real)) return errno == ENOENT || errno == ENOTDIR;   /* inexistant : les handlers répondent 404 */
+    size_t n = strlen(d->src);
+    return !strncmp(real, d->src, n) && (real[n] == 0 || real[n] == '/');
 }
 
 int disk_make(const char *id, char *err, size_t esz)
@@ -47,10 +67,11 @@ int rm_tree(const char *path)
     return nftw(path, rm_cb, 32, FTW_DEPTH | FTW_PHYS);
 }
 
+/* Ne supprime JAMAIS qu'un dossier de <données>/disks : un dossier monté n'est donc jamais touché. */
 int disk_destroy(const char *id)
 {
     char d[640];
-    disk_dir(id, d, sizeof d);
+    default_dir(id, d, sizeof d);
     disk_usage_forget(id);
     rm_tree(d);
     return 0;
@@ -94,6 +115,13 @@ int disk_usage(const char *id, unsigned long long *total, unsigned long long *us
 {
     disk_t d;
     if (disk_get(id, &d) < 0) return -1;
+    if (d.src[0]) {                                  /* montage : occupation du volume source, sans parcours */
+        struct statvfs sv;
+        if (statvfs(d.src, &sv) < 0) return -1;
+        *total = (unsigned long long)sv.f_blocks * sv.f_frsize;
+        *used  = (unsigned long long)(sv.f_blocks - sv.f_bfree) * sv.f_frsize;
+        return 0;
+    }
     time_t now = time(NULL);
     unsigned long long u = 0;
     int fresh = 0;

@@ -67,6 +67,7 @@ static int open_ctx(req_t *r, const char *user, int need, ctx_t *c, const char *
     if (snprintf(c->full, sizeof c->full, "%s%s", c->mnt, strcmp(c->rel, "/") ? c->rel : "") >= (int)sizeof c->full) {
         send_err(r, 400, "chemin trop long"); goto out;
     }
+    if (!mount_inside(&c->d, c->full)) { send_err(r, 403, "chemin hors du dossier monté"); goto out; }
     rc = 0;
 out:
     free(id); free(path);
@@ -224,9 +225,11 @@ static void disk_json(sbuf *b, const disk_t *d, int perm)
     disk_usage(d->id, &total, &used);
     sb_addf(b, "{\"id\":\"%s\",\"name\":", d->id);
     sb_json(b, d->name);
-    sb_addf(b, ",\"size\":%llu,\"used\":%llu,\"personal\":%s,\"owner\":", d->size, used, d->owner[0] ? "true" : "false");
+    sb_addf(b, ",\"size\":%llu,\"used\":%llu,\"personal\":%s,\"owner\":", d->src[0] ? total : d->size, used, d->owner[0] ? "true" : "false");
     sb_json(b, d->owner);
-    sb_addf(b, ",\"perm\":\"%s\"}", perm >= PERM_RW ? "rw" : "r");
+    sb_addf(b, ",\"perm\":\"%s\"", perm >= PERM_RW ? "rw" : "r");
+    if (d->src[0]) sb_add(b, ",\"mounted\":true,\"readonly\":true");   /* le chemin source n'est jamais révélé aux utilisateurs */
+    sb_add(b, "}");
 }
 
 static void h_disks(req_t *r)
@@ -533,6 +536,46 @@ static void h_admin_disk_create(req_t *r)
     free(name); free(sz);
 }
 
+/* Monte un dossier local en lecture seule, pour tous les utilisateurs (?path=/chemin/absolu&name=Nom) */
+static void h_admin_disk_mount(req_t *r)
+{
+    char me[33], err[400] = "", id[17];
+    if (auth(r, me) || need_admin(r, me)) return;
+    char *path = req_param(r, "path"), *name = req_param(r, "name");
+    if (!path || path[0] != '/') send_err(r, 400, "chemin absolu requis");
+    else if (disk_mount(name, path, id, err, sizeof err) < 0) send_err(r, 400, err);
+    else {
+        logmsg("montage en lecture seule par '%s' : %s -> %s", me, path, name && *name ? name : "(nom du dossier)");
+        sbuf b; sb_init(&b);
+        sb_addf(&b, "{\"ok\":true,\"id\":\"%s\"}", id);
+        send_json(r, 200, b.p);
+        sb_free(&b);
+    }
+    free(path); free(name);
+}
+
+/* Liste des montages avec leur dossier source (administrateur uniquement) */
+static void h_admin_mounts(req_t *r)
+{
+    char me[33];
+    if (auth(r, me) || need_admin(r, me)) return;
+    static __thread disk_t all[512];
+    int n = disk_list(all, 512), first = 1;
+    sbuf b; sb_init(&b);
+    sb_add(&b, "{\"ok\":true,\"mounts\":[");
+    for (int i = 0; i < n; i++) {
+        if (!all[i].src[0]) continue;
+        if (!first) sb_add(&b, ",");
+        first = 0;
+        sb_addf(&b, "{\"id\":\"%s\",\"name\":", all[i].id); sb_json(&b, all[i].name);
+        sb_add(&b, ",\"source\":"); sb_json(&b, all[i].src);
+        sb_add(&b, "}");
+    }
+    sb_add(&b, "]}");
+    send_json(r, 200, b.p);
+    sb_free(&b);
+}
+
 static void h_admin_disk_delete(req_t *r)
 {
     char me[33], err[160] = "";
@@ -542,7 +585,7 @@ static void h_admin_disk_delete(req_t *r)
     if (!id || disk_get(id, &d) < 0) send_err(r, 404, "disque introuvable");
     else if (d.owner[0]) send_err(r, 400, "un espace personnel se supprime avec son utilisateur");
     else if (disk_delete(id, err, sizeof err) < 0) send_err(r, 400, err);
-    else { logmsg("disque supprimé : %s", d.name); ok(r); }
+    else { logmsg(d.src[0] ? "montage retiré : %s (dossier source intact)" : "disque supprimé : %s", d.name); ok(r); }
     free(id);
 }
 
@@ -575,7 +618,7 @@ static void h_admin_perm_set(req_t *r)
     char *id = req_param(r, "disk"), *u = req_param(r, "user"), *p = req_param(r, "perm");
     int perm = !p ? -1 : !strcmp(p, "rw") ? PERM_RW : !strcmp(p, "r") ? PERM_READ : !strcmp(p, "none") ? PERM_NONE : -1;
     if (!id || !u || perm < 0) send_err(r, 400, "paramètres invalides");
-    else if (perm_set(id, u, perm) < 0) send_err(r, 400, "disque/utilisateur introuvable ou espace personnel");
+    else if (perm_set(id, u, perm) < 0) send_err(r, 400, "disque/utilisateur introuvable, espace personnel ou montage (lecture seule pour tous)");
     else ok(r);
     free(id); free(u); free(p);
 }
@@ -606,6 +649,8 @@ static const route_t routes[] = {
     { "POST", "/api/admin/user_create", h_admin_user_create },
     { "POST", "/api/admin/user_delete", h_admin_user_delete },
     { "POST", "/api/admin/disk_create", h_admin_disk_create },
+    { "POST", "/api/admin/disk_mount",  h_admin_disk_mount },
+    { "GET",  "/api/admin/mounts",      h_admin_mounts },
     { "POST", "/api/admin/disk_delete", h_admin_disk_delete },
     { "GET",  "/api/admin/perms",       h_admin_perms },
     { "POST", "/api/admin/perm_set",    h_admin_perm_set },

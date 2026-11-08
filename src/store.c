@@ -1,6 +1,7 @@
 /* Configuration, users, disks, permissions and sessions. Flat TSV files, one global lock. */
 #include "hc.h"
 #include <errno.h>
+#include <limits.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <openssl/evp.h>
@@ -109,12 +110,15 @@ static void load_all(void)
     if ((fp = fopen(path, "r"))) {
         while (ndisks < MAXD && fgets(line, sizeof line, fp)) {
             line[strcspn(line, "\r\n")] = 0;
-            if (split_tab(line, f, 4) < 4) continue;
+            int nf = split_tab(line, f, 5);
+            if (nf < 4) continue;
             disk_t *d = &disks[ndisks++];
+            memset(d, 0, sizeof *d);
             snprintf(d->id, sizeof d->id, "%s", f[0]);
             snprintf(d->name, sizeof d->name, "%s", f[1]);
             d->size = strtoull(f[2], NULL, 10);
             snprintf(d->owner, sizeof d->owner, "%s", f[3]);
+            if (nf >= 5) snprintf(d->src, sizeof d->src, "%s", f[4]);
         }
         fclose(fp);
     }
@@ -164,7 +168,7 @@ static void save_file(const char *name, void (*writer)(FILE *))
 }
 
 static void w_users(FILE *f) { for (int i = 0; i < nusers; i++) fprintf(f, "%s\t%s\t%s\t%d\t%s\n", users[i].name, users[i].salt, users[i].hash, users[i].admin, users[i].personal); }
-static void w_disks(FILE *f) { for (int i = 0; i < ndisks; i++) fprintf(f, "%s\t%s\t%llu\t%s\n", disks[i].id, disks[i].name, disks[i].size, disks[i].owner); }
+static void w_disks(FILE *f) { for (int i = 0; i < ndisks; i++) fprintf(f, "%s\t%s\t%llu\t%s\t%s\n", disks[i].id, disks[i].name, disks[i].size, disks[i].owner, disks[i].src); }
 static void w_perms(FILE *f) { for (int i = 0; i < nperms; i++) fprintf(f, "%s\t%s\t%d\n", perms[i].disk, perms[i].user, perms[i].perm); }
 
 static void w_locks(FILE *f) { for (int i = 0; i < nlocks; i++) fprintf(f, "%s\t%s\t%s\t%s\t%s\n", locks[i].disk, locks[i].path, locks[i].owner, locks[i].salt, locks[i].hash); }
@@ -391,11 +395,73 @@ int disk_delete(const char *id, char *err, size_t esz)
     pthread_mutex_lock(&lk);
     disk_t *d = find_disk(id);
     if (!d) { pthread_mutex_unlock(&lk); snprintf(err, esz, "disque introuvable"); return -1; }
+    int mounted = d->src[0] != 0;
     remove_disk_locked(id);
     save_locked();
     pthread_mutex_unlock(&lk);
-    disk_destroy(id);
+    if (mounted) disk_usage_forget(id);               /* démontage : le dossier source reste intact */
+    else disk_destroy(id);
     return 0;
+}
+
+/* dir == p, ou p se trouve sous dir */
+static int path_within(const char *dir, const char *p)
+{
+    size_t n = strlen(dir);
+    if (n == 1 && dir[0] == '/') return p[0] == '/';
+    return !strncmp(p, dir, n) && (p[n] == 0 || p[n] == '/');
+}
+
+/* Monte un dossier local comme disque en lecture seule, visible par tous les utilisateurs. */
+int disk_mount(const char *name, const char *path, char *id_out, char *err, size_t esz)
+{
+    char real[PATH_MAX], other[PATH_MAX];
+    struct stat st;
+    if (!path || !*path) { snprintf(err, esz, "chemin manquant"); return -1; }
+    if (strpbrk(path, "\t\r\n")) { snprintf(err, esz, "chemin non supporté (caractère de contrôle)"); return -1; }
+    if (!realpath(path, real)) { snprintf(err, esz, "dossier introuvable (%s)", strerror(errno)); return -1; }
+    if (stat(real, &st) < 0 || !S_ISDIR(st.st_mode)) { snprintf(err, esz, "ce n'est pas un dossier"); return -1; }
+    if (access(real, R_OK | X_OK) < 0) { snprintf(err, esz, "dossier non lisible (%s)", strerror(errno)); return -1; }
+    if (strlen(real) >= sizeof ((disk_t *)0)->src) { snprintf(err, esz, "chemin trop long"); return -1; }
+
+    /* jamais le dossier privé (mots de passe, verrous) ni les espaces des utilisateurs, ni un de leurs parents */
+    if ((realpath(g_home, other) && (path_within(real, other) || path_within(other, real))) ||
+        (realpath(g_cfg.data_dir, other) && (path_within(real, other) || path_within(other, real)))) {
+        snprintf(err, esz, "ce dossier contient (ou se trouve dans) les données de Home Cloud : choisissez-en un autre");
+        return -1;
+    }
+
+    char label[65] = "";
+    const char *src_name = (name && *name) ? name : strrchr(real, '/') + 1;
+    for (const char *s = src_name; *s && strlen(label) < sizeof label - 1; s++) {
+        char c[2] = { (*s == '\t' || *s == '\n' || *s == '\r') ? ' ' : *s, 0 };
+        strcat(label, c);
+    }
+    if (!label[0]) { snprintf(err, esz, "nom de disque invalide (1-64 caractères)"); return -1; }
+
+    char id[17];
+    if (random_hex(id, 8) < 0) { snprintf(err, esz, "aléa indisponible"); return -1; }
+
+    pthread_mutex_lock(&lk);
+    int rc = -1;
+    if (ndisks >= MAXD) snprintf(err, esz, "nombre maximal de disques atteint");
+    else {
+        for (int i = 0; i < ndisks; i++) {
+            if (!strcmp(disks[i].src, real)) { snprintf(err, esz, "ce dossier est déjà monté (« %s »)", disks[i].name); goto done; }
+            if (!strcmp(disks[i].name, label)) { snprintf(err, esz, "un disque porte déjà le nom « %s »", label); goto done; }
+        }
+        disk_t *d = &disks[ndisks++];
+        memset(d, 0, sizeof *d);
+        snprintf(d->id, sizeof d->id, "%s", id);
+        snprintf(d->name, sizeof d->name, "%s", label);
+        snprintf(d->src, sizeof d->src, "%s", real);
+        save_locked();
+        if (id_out) snprintf(id_out, 17, "%s", id);
+        rc = 0;
+    }
+done:
+    pthread_mutex_unlock(&lk);
+    return rc;
 }
 
 /* ================= permissions ================= */
@@ -406,7 +472,8 @@ int perm_effective(const char *user, const char *diskid)
     user_t *u = find_user(user);
     disk_t *d = find_disk(diskid);
     if (u && d) {
-        if (u->admin) r = PERM_RW;
+        if (d->src[0]) r = PERM_READ;               /* montage : lecture seule pour tout le monde, administrateurs compris */
+        else if (u->admin) r = PERM_RW;
         else if (d->owner[0]) r = strcmp(d->owner, user) == 0 ? PERM_RW : PERM_NONE;
         else for (int i = 0; i < nperms; i++)
             if (!strcmp(perms[i].disk, diskid) && !strcmp(perms[i].user, user)) { r = perms[i].perm; break; }
@@ -421,7 +488,7 @@ int perm_set(const char *diskid, const char *user, int perm)
     pthread_mutex_lock(&lk);
     disk_t *d = find_disk(diskid);
     user_t *u = find_user(user);
-    if (d && u && !d->owner[0] && perm >= 0 && perm <= 2) {
+    if (d && u && !d->owner[0] && !d->src[0] && perm >= 0 && perm <= 2) {
         for (int i = 0; i < nperms; i++)
             if (!strcmp(perms[i].disk, diskid) && !strcmp(perms[i].user, user)) {
                 if (perm == PERM_NONE) perms[i] = perms[--nperms]; else perms[i].perm = perm;
@@ -581,6 +648,12 @@ void store_check_disks(void)
     for (int i = 0; i < n; i++) {
         char d[640];
         disk_dir(tmp[i].id, d, sizeof d);
+        if (tmp[i].src[0]) {                           /* montage : on ne crée rien, on vérifie seulement */
+            struct stat st;
+            if (stat(d, &st) == 0 && S_ISDIR(st.st_mode)) logmsg("montage en lecture seule prêt : %s (%s)", tmp[i].name, tmp[i].id);
+            else logmsg("ATTENTION : dossier monté introuvable pour %s (%s)", tmp[i].name, tmp[i].id);
+            continue;
+        }
         if (mkdir_p(d, 0700) == 0) logmsg("disque prêt : %s (%s)", tmp[i].name, tmp[i].id);
         else logmsg("ERREUR : dossier introuvable pour %s (%s)", tmp[i].name, tmp[i].id);
     }

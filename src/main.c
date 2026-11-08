@@ -389,11 +389,79 @@ static void cmd_status(void)
     for (int i = 0; i < nd; i++) {
         unsigned long long t = 0, u = 0;
         disk_usage(ds[i].id, &t, &u);
-        snprintf(b, sizeof b, "%llu Mo utilisés / quota %llu Mo", u >> 20, t >> 20);
+        if (ds[i].src[0]) snprintf(b, sizeof b, "lecture seule (monté) : %llu Mo utilisés / %llu Mo", u >> 20, t >> 20);
+        else snprintf(b, sizeof b, "%llu Mo utilisés / quota %llu Mo", u >> 20, t >> 20);
         ui_kv(ds[i].name, b);
     }
     printf("\n");
     if (pid) { printf("  Adresses du serveur :\n"); print_addresses(g_cfg.port); printf("\n"); }
+}
+
+/* ---------------- montages en lecture seule ---------------- */
+/* Le démon garde l'état en mémoire : on l'arrête pendant la modification, puis on le relance. */
+static void cmd_mount(const char *raw, const char *name)
+{
+    char path[640], err[400] = "", id[17];
+    int was = running_pid() != 0, rc;
+    if (was) cmd_stop();
+    if (load_or_die(1) < 0) exit(1);
+    expand_home(raw, path, sizeof path);
+    rc = disk_mount(name, path, id, err, sizeof err);
+    if (rc < 0) ui_err("Montage impossible : %s", err);
+    else {
+        disk_t d;
+        disk_get(id, &d);
+        ui_ok("« %s » monté en lecture seule, visible par tous les utilisateurs.", d.name);
+        ui_kv("Dossier source", d.src);
+        ui_kv("Identifiant", d.id);
+        ui_info("Aucun fichier ne peut y être ajouté, modifié ou supprimé via Home Cloud.");
+    }
+    if (was) cmd_start(0);
+    else if (rc == 0) ui_info("Le montage sera actif au prochain démarrage : homecloud-server start");
+    if (rc < 0) exit(1);
+}
+
+static int find_mount(const char *key, disk_t *out)
+{
+    static disk_t ds[512];
+    int n = disk_list(ds, 512);
+    for (int i = 0; i < n; i++)
+        if (ds[i].src[0] && (!strcmp(ds[i].id, key) || !strcmp(ds[i].name, key))) { *out = ds[i]; return 0; }
+    return -1;
+}
+
+static void cmd_umount(const char *key)
+{
+    char err[200] = "";
+    disk_t d;
+    int was = running_pid() != 0, rc = -1;
+    if (was) cmd_stop();
+    if (load_or_die(1) < 0) exit(1);
+    if (find_mount(key, &d) < 0) ui_err("Aucun montage nommé « %s » (voir : homecloud-server mounts).", key);
+    else if ((rc = disk_delete(d.id, err, sizeof err)) < 0) ui_err("Démontage impossible : %s", err);
+    else {
+        ui_ok("« %s » démonté.", d.name);
+        ui_info("Le dossier source n'a pas été touché : %s", d.src);
+    }
+    if (was) cmd_start(0);
+    if (rc < 0) exit(1);
+}
+
+static void cmd_mounts(void)
+{
+    if (load_or_die(1) < 0) exit(1);
+    static disk_t ds[512];
+    int n = disk_list(ds, 512), shown = 0;
+    ui_title("Dossiers montés (lecture seule, pour tous)");
+    for (int i = 0; i < n; i++) {
+        if (!ds[i].src[0]) continue;
+        char line[700];
+        snprintf(line, sizeof line, "%.500s  [%.16s]", ds[i].src, ds[i].id);
+        ui_kv(ds[i].name, line);
+        shown++;
+    }
+    if (!shown) ui_info("Aucun. Exemple : homecloud-server mount ~/storage/shared/Photos Photos");
+    printf("\n");
 }
 
 static void usage(void)
@@ -407,6 +475,9 @@ static void usage(void)
     ui_kv("run", "démarre au premier plan (journal à l'écran, Ctrl+C pour quitter)");
     ui_kv("status", "état du service, adresses, disques et occupation");
     ui_kv("passwd <utilisateur>", "réinitialise un mot de passe");
+    ui_kv("mount <dossier> [nom]", "monte un dossier local en disque LECTURE SEULE pour tous");
+    ui_kv("umount <nom|id>", "retire un montage (le dossier source n'est pas touché)");
+    ui_kv("mounts", "liste les dossiers montés");
     ui_kv("version", "affiche la version");
     printf("\n");
 }
@@ -422,6 +493,9 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[1], "restart")) { cmd_stop(); return cmd_start(0) == 0 ? 0 : 1; }
     else if (!strcmp(argv[1], "status"))  cmd_status();
     else if (!strcmp(argv[1], "passwd") && argc == 3) cmd_passwd(argv[2]);
+    else if (!strcmp(argv[1], "mount") && (argc == 3 || argc == 4)) cmd_mount(argv[2], argc == 4 ? argv[3] : NULL);
+    else if (!strcmp(argv[1], "umount") && argc == 3) cmd_umount(argv[2]);
+    else if (!strcmp(argv[1], "mounts"))  cmd_mounts();
     else if (!strcmp(argv[1], "version")) printf("homecloud-server %s\n", HC_VERSION);
     else { usage(); return 1; }
     return 0;

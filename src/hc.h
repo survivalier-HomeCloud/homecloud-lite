@@ -13,7 +13,7 @@
 #include <sys/types.h>
 #include <pthread.h>
 
-#define HC_VERSION        "1.0.0-lite"
+#define HC_VERSION        "1.1.0-lite"
 #define HC_DEFAULT_PORT   8650
 #define HC_DISCOVERY_PORT 8651
 #define HC_MIN_QUOTA_GB   5
@@ -69,6 +69,7 @@ typedef struct {
 typedef struct {
     char id[17], name[65], owner[33];  /* owner != "" -> personal disk */
     unsigned long long size;
+    char src[512];                     /* != "" -> montage : dossier local exposé en LECTURE SEULE pour tous */
 } disk_t;
 
 typedef struct {
@@ -89,6 +90,7 @@ int  user_get(const char *name, user_t *out);
 int  user_list(user_t *out, int max);
 int  disk_create(const char *name, unsigned long long size, const char *owner, char *id_out, char *err, size_t esz);
 int  disk_delete(const char *id, char *err, size_t esz);
+int  disk_mount(const char *name, const char *path, char *id_out, char *err, size_t esz); /* monte un dossier local (lecture seule) */
 int  disk_get(const char *id, disk_t *out);
 int  disk_list(disk_t *out, int max);
 int  perm_effective(const char *user, const char *diskid);   /* 0/1/2 */
@@ -116,6 +118,7 @@ int  disk_usage(const char *id, unsigned long long *total, unsigned long long *u
 void disk_usage_forget(const char *id);                 /* invalide le cache d'occupation */
 void disk_usage_adjust(const char *id, long long delta); /* corrige le cache après un envoi */
 int  rm_tree(const char *path);
+int  mount_inside(const disk_t *d, const char *full);   /* 1 si `full` reste dans le dossier monté (anti-symlink) */
 
 /* ---------- http.c / api.c ---------- */
 void http_serve(int port);
